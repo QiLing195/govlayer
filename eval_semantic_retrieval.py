@@ -39,36 +39,14 @@ sys.path.insert(0, str(ROOT))
 
 from cformer_v63.ann_index import PermissionPartitionedIndex  # noqa: E402
 from cformer_v63.embedding import build_encoder               # noqa: E402
+# 查询集改为从单一来源取（避免多处定义漂移；换数据集时也不用改本脚本）
+from eval_query_sets import sets_for                          # noqa: E402
 
 DATA = ROOT / "data"
 ARTIFACTS = ROOT / "artifacts"
 
-# ---- 查询组 1：措辞贴近（问题里带着条款关键词）----
-# 这些题上字符重叠检索应当表现良好，属于对照组。
-NEAR_QUERIES: list[tuple[str, str]] = [
-    ("员工连续旷工多久会被劝退？", "penalty"),
-    ("上班时间是几点？", "work-hours"),
-    ("忘记打卡怎么办？", "punch"),
-    ("请假需要什么材料和审批？", "leave"),
-    ("假期结束不能返岗怎么办？", "return"),
-    ("出差需要提前报备吗？", "travel"),
-    ("迟到早退怎么扣钱？", "penalty"),
-    ("每月的考勤统计表由谁上报？", "stats"),
-]
-
-# ---- 查询组 2：措辞远离（刻意避开该条款的关键词表）----
-# 这才是决定"语义检索值不值"的一组。每条都刻意不用 obj["keywords"] 里的任何词。
-DISTANT_QUERIES: list[tuple[str, str]] = [
-    ("一个月不来上班几天会被开除？", "penalty"),          # 制度原文：「旷工…予以劝退」
-    ("早上来得太晚有什么后果？", "penalty"),               # 制度原文：「迟到早退每次扣日工资50元」
-    ("一天要在岗多少小时？", "work-hours"),               # 制度原文：「每天8小时」
-    ("身体不舒服需要休息该走什么手续？", "leave"),        # 制度原文：「病假需县市级医院证明」
-    ("休完假回单位还要办什么？", "return"),               # 制度原文：「销假」
-    ("要去外地办事需要提前打招呼吗？", "travel"),        # 制度原文：「出差需出差前报备」
-    ("每月的出勤记录由谁汇总？", "stats"),                # 制度原文：「上报考勤统计表」
-    ("漏了一次刷卡记录该怎么处理？", "punch"),            # 制度原文：「忘打卡需说明情况」
-    ("请了几天假回来晚了算不算不来上班？", "penalty"),     # 制度原文：「不及时销假按缺勤/旷工处理」
-]
+# 本脚本默认针对员工制度库；查询集定义见 eval_query_sets.py
+NEAR_QUERIES, DISTANT_QUERIES, _OFF_DOMAIN, _SAME_DOMAIN = sets_for("employee_rules")
 
 # ---- 同域干扰条款词表（HR 主题，越像真制度越有区分度）----
 TOPICS = ["报销", "加班", "培训", "绩效", "薪酬", "社保", "公积金", "调岗", "晋升",
