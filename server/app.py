@@ -7,10 +7,16 @@
   - 可选接入 DeepSeek：**只有权限过滤后的可见内容才进 Prompt**（泄漏在源头掐断）。
 
 接口：
-  GET  /api/datasets            → 可用知识库 + 角色列表
-  POST /api/ask                 → {dataset, role, question} → 治理后答案 + 依据
-  GET  /                        → 前端演示页
   GET  /healthz                 → 健康检查
+  GET  /api/datasets            → 可用知识库 + 角色列表
+  GET  /api/tokens              → 演示用身份令牌（生产应下线，改由 SSO 签发）
+  POST /api/ask                 → {dataset, question} → 治理后答案 + 依据
+                                  身份取自请求头 X-API-Token（请求体 role 一律忽略）
+  GET  /                        → 前端演示页
+
+鉴权（#3 角色伪造防护）：
+  客户端只能提供 Token；服务端解析出**权限级别**，再按知识库映射到角色名。
+  这样同一个 Token 在"企业制度/迎新报到/家庭"等不同库自动落到对应角色。
 
 运行：
   pip install -r requirements-serve.txt
@@ -21,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -39,6 +46,7 @@ sys.path.insert(0, str(SERVER_DIR))   # 使同目录 auth.py 可导入
 from cformer_v63.governance import GovLayer, load_dataset  # noqa: E402
 from cformer_v63.semantic import LLMSemanticBackend  # noqa: E402
 from auth import DEMO_TOKENS, dev_mode, resolve_identity, role_for_level  # noqa: E402
+from audit import AuditLog, question_field, token_fingerprint  # noqa: E402
 
 DATA_DIR = ROOT / "data"
 STATIC_DIR = SERVER_DIR / "static"
@@ -48,6 +56,9 @@ app = FastAPI(title="C-Former GovLayer", version="0.2.0")
 # 语义后端（#1 检索语义化 + #2 覆盖判定）：有 DEEPSEEK_API_KEY 时启用，
 # 否则自动降级为关键词检索 + 词表探针（零依赖可跑）。
 SEMANTIC = LLMSemanticBackend()
+
+# 审计日志（#5）：追加式 JSONL，绝不落原始令牌，只存指纹；写盘失败不影响业务。
+AUDIT = AuditLog()
 
 # ---- 知识库加载（dataset 驱动：新客户只需加一个 gov_*.json）----
 _LAYERS: dict[str, GovLayer] = {}
@@ -85,8 +96,8 @@ class AskRequest(BaseModel):
 
 class AskResponse(BaseModel):
     question: str
-    role: str
-    verdict: str                 # covered | gap | out_of_scope
+    role: str                    # 服务端解析出的角色（非客户端声明）
+    verdict: str                 # covered | restricted | gap | out_of_scope
     answer_text: str             # 治理后返回给用户的内容（LLM 或条款原文）
     visible_sources: list[dict]  # [{id, title, content}] 权限过滤后的依据
     denied_fields: list[str]     # 命中但因权限被截断的条目
@@ -148,66 +159,145 @@ def tokens() -> list[dict]:
 @app.post("/api/ask", response_model=AskResponse)
 def ask(req: AskRequest,
         x_api_token: str | None = Header(default=None, alias="X-API-Token")) -> AskResponse:
-    layer = _LAYERS.get(req.dataset)
-    if layer is None:
-        raise HTTPException(status_code=404, detail=f"unknown dataset: {req.dataset}")
+    t0 = time.perf_counter()
+    rec: dict = {
+        "dataset": req.dataset,
+        "token_fp": token_fingerprint(x_api_token),   # 只存指纹，绝不存令牌原文
+        **question_field(req.question),
+    }
+    try:
+        # #3 安全：先校验身份，再解析数据集。
+        # 顺序很重要：若先查 dataset，未认证请求会因库名存在与否得到 404 / 401 两种
+        # 结果，这个差异本身就变成一个**未认证的知识库名枚举探针**。
+        # 先认证则未认证请求一律 401，不泄漏任何数据集信息。
+        role_levels = _LAYERS[req.dataset].roles if req.dataset in _LAYERS else {}
+        identity = resolve_identity(x_api_token, req.role, role_levels)
+        if identity is None:
+            # 未认证请求：只留"有人试过"的信号，**不留问题原文**。
+            # 否则任何人无需凭证就能往审计日志里灌任意内容（日志投毒 / 撑爆磁盘），
+            # 审计日志本身反而成了攻击面。
+            for k in ("question", "question_sha256", "question_redacted"):
+                rec.pop(k, None)
+            rec["question_withheld"] = "unauthenticated"
+            rec.update(event="auth_failed", reason="invalid_or_missing_token", status=401)
+            raise HTTPException(status_code=401,
+                                detail="缺少或无效的身份令牌（请在 X-API-Token 头提供）")
+        rec.update(identity_label=identity.label, level=identity.level)
 
-    # #3 安全：身份来自服务端签发的令牌，**忽略请求体 role**（防越权伪造）
-    identity = resolve_identity(x_api_token, req.role, layer.roles)
-    if identity is None:
+        layer = _LAYERS.get(req.dataset)
+        if layer is None:
+            rec.update(event="ask_denied", reason="unknown_dataset", status=404)
+            raise HTTPException(status_code=404, detail=f"unknown dataset: {req.dataset}")
+
+        role = role_for_level(layer.roles, identity.level)
+        if role is None:
+            rec.update(event="ask_denied", reason="level_below_dataset_minimum", status=403)
+            raise HTTPException(status_code=403,
+                                detail=f"你的权限级别 {identity.level} 无权访问该知识库")
+        rec["role"] = role
+
+        ans = layer.answer(req.question, role)
+
+        # 权限过滤后的可见依据（只有这些内容会被交给 LLM）
+        sources = []
+        for oid, content in ans.visible_texts.items():
+            obj = next(o for o in layer.objects if o["id"] == oid)
+            sources.append({"id": oid, "title": obj.get("title", oid),
+                            "content": content or "（无权限查看此内容）"})
+
+        visible_context = "\n---\n".join(
+            f"《{s['title']}》：{s['content']}" for s in sources
+            if s["content"] and "无权限" not in s["content"]
+        )
+        # 回答生成：
+        #  - restricted（权限截断）：**不交给 LLM**——否则模型会把"你无权限"说成"资料不足"，
+        #    必须由治理层直接给出权限声明（这是本系统的核心语义，不能被生成层稀释）；
+        #  - gap（知识空白）：也不交给 LLM（避免编造），走治理层升级话术；
+        #  - 其余情况才允许 LLM 基于可见内容生成自然语言。
+        llm_text = None
+        if ans.verdict not in ("restricted", "gap"):
+            llm_text = _llm_answer(req.question, visible_context, ans.verdict)
+
+        if ans.verdict == "restricted":
+            answer_text = ans.boundary_note or "该问题涉及的信息超出你的角色权限范围。"
+        elif llm_text:
+            answer_text = llm_text
+        elif ans.verdict == "gap":
+            answer_text = ("根据现有制度无法回答此问题。" + (ans.boundary_note or ""))
+        elif ans.verdict == "out_of_scope":
+            answer_text = "此问题不在已登记制度范围内，建议咨询 HR。"
+        else:
+            answer_text = visible_context or "根据你的权限，没有可展示的内容。"
+
+        # 审计重点记录"判定"而非"回答文本"：复盘时要回答的是
+        # 「谁·问了哪个知识点·为什么被截断」，不是复述答案。
+        rec.update(event="ask", status=200, verdict=ans.verdict,
+                   hit_ids=list(ans.hit_ids), denied_fields=list(ans.denied_fields),
+                   n_sources=len(sources), semantic_used=bool(ans.semantic_used),
+                   llm_used=bool(llm_text),
+                   typo_corrections=list(ans.typo_corrections))
+
+        return AskResponse(
+            # role 必须是**服务端解析出的角色**：回显 req.role 会把伪造声明当成事实，
+            # 前端据此展示身份就会把"员工"显示成"HR"（#3 修复的最后一个漏点）。
+            question=req.question, role=role, verdict=ans.verdict,
+            answer_text=answer_text,
+            visible_sources=sources,
+            denied_fields=ans.denied_fields,
+            precedents=[{k: c.get(k) for k in ("case_id", "topic", "ruling", "reasoning",
+                                               "approver", "date", "reference_only")}
+                        for c in ans.precedents],
+            boundary_note=ans.boundary_note or "",
+            typo_corrections=ans.typo_corrections,
+            semantic_used=ans.semantic_used,
+            identity=f"{identity.label}（级别 {identity.level} → 角色 {role}）",
+            llm_used=bool(llm_text),
+        )
+    finally:
+        # 成功 / 401 / 403 / 404 / 甚至未预期异常（500）都留痕：
+        # 审计的价值恰恰在"失败与拒绝"上，只记成功等于没记。
+        rec["latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        AUDIT.record(rec)
+
+
+# ---- 审计查询（本身也受权限门控：审计日志不是谁都能看）----
+def _auditor_level() -> int:
+    """能看审计日志所需的级别 = 所有知识库中的最高级别。"""
+    levels = [lvl for spec in _DATASETS.values() for lvl in spec["roles"].values()]
+    return max(levels) if levels else 0
+
+
+def _require_auditor(x_api_token: str | None):
+    ident = resolve_identity(x_api_token, None, {})
+    if ident is None:
+        AUDIT.record({"event": "auth_failed", "scope": "audit",
+                      "reason": "invalid_or_missing_token", "status": 401,
+                      "token_fp": token_fingerprint(x_api_token)})
         raise HTTPException(status_code=401,
                             detail="缺少或无效的身份令牌（请在 X-API-Token 头提供）")
-    role = role_for_level(layer.roles, identity.level)
-    if role is None:
+    if ident.level < _auditor_level():
+        AUDIT.record({"event": "audit_denied", "scope": "audit",
+                      "reason": "level_below_auditor", "level": ident.level,
+                      "status": 403, "token_fp": token_fingerprint(x_api_token)})
         raise HTTPException(status_code=403,
-                            detail=f"你的权限级别 {identity.level} 无权访问该知识库")
+                            detail=f"审计日志需要权限级别 ≥ {_auditor_level()}")
+    return ident
 
-    ans = layer.answer(req.question, role)
 
-    # 权限过滤后的可见依据（只有这些内容会被交给 LLM）
-    sources = []
-    for oid, content in ans.visible_texts.items():
-        obj = next(o for o in layer.objects if o["id"] == oid)
-        sources.append({"id": oid, "title": obj.get("title", oid),
-                        "content": content or "（无权限查看此内容）"})
+@app.get("/api/audit")
+def audit_tail(limit: int = 50, event: str | None = None,
+               x_api_token: str | None = Header(default=None, alias="X-API-Token")) -> dict:
+    """最近 N 条审计记录（最新在前）+ 汇总统计。"""
+    _require_auditor(x_api_token)
+    return {"records": AUDIT.tail(limit, event), "stats": AUDIT.stats()}
 
-    visible_context = "\n---\n".join(
-        f"《{s['title']}》：{s['content']}" for s in sources if s["content"] and "无权限" not in s["content"]
-    )
-    # 回答生成：
-    #  - restricted（权限截断）：**不交给 LLM**——否则模型会把"你无权限"说成"资料不足"，
-    #    必须由治理层直接给出权限声明（这是本系统的核心语义，不能被生成层稀释）；
-    #  - gap（知识空白）：也不交给 LLM（避免编造），走治理层升级话术；
-    #  - 其余情况才允许 LLM 基于可见内容生成自然语言。
-    llm_text = None
-    if ans.verdict not in ("restricted", "gap"):
-        llm_text = _llm_answer(req.question, visible_context, ans.verdict)
 
-    if ans.verdict == "restricted":
-        answer_text = ans.boundary_note or "该问题涉及的信息超出你的角色权限范围。"
-    elif llm_text:
-        answer_text = llm_text
-    elif ans.verdict == "gap":
-        answer_text = ("根据现有制度无法回答此问题。" + (ans.boundary_note or ""))
-    elif ans.verdict == "out_of_scope":
-        answer_text = "此问题不在已登记制度范围内，建议咨询 HR。"
-    else:
-        answer_text = visible_context or "根据你的权限，没有可展示的内容。"
-
-    return AskResponse(
-        question=req.question, role=req.role, verdict=ans.verdict,
-        answer_text=answer_text,
-        visible_sources=sources,
-        denied_fields=ans.denied_fields,
-        precedents=[{k: c.get(k) for k in ("case_id", "topic", "ruling", "reasoning",
-                                           "approver", "date", "reference_only")}
-                    for c in ans.precedents],
-        boundary_note=ans.boundary_note or "",
-        typo_corrections=ans.typo_corrections,
-        semantic_used=ans.semantic_used,
-        identity=f"{identity.label}（级别 {identity.level} → 角色 {role}）",
-        llm_used=bool(llm_text),
-    )
+@app.get("/api/audit/stats")
+def audit_stats(x_api_token: str | None = Header(default=None,
+                                                 alias="X-API-Token")) -> dict:
+    """审计汇总：按判定/事件/角色统计 + 鉴权失败次数 + 延迟。"""
+    _require_auditor(x_api_token)
+    return AUDIT.stats()
 
 
 # ---- 前端 ----

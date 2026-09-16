@@ -1,13 +1,19 @@
 services:
   govlayer:
     build: .
-    image: cformer-govlayer:0.1.0
+    image: cformer-govlayer:0.2.0
     container_name: cformer-govlayer
     ports:
       - "8000:8000"
     environment:
       # 可选：需要 LLM 自然语言回答时填入（只喂权限过滤后的可见内容）
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      # 审计日志落在挂载卷里，容器重建后仍可回溯
+      - GOVLAYER_AUDIT_LOG=/app/audit/audit.jsonl
+      # =1 时不落问题原文，只存哈希+长度（强隐私客户）
+      - GOVLAYER_AUDIT_REDACT=${GOVLAYER_AUDIT_REDACT:-0}
+    volumes:
+      - ./audit:/app/audit
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]

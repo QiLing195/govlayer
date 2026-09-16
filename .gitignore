@@ -6,4 +6,6 @@ tmp_testrun/
 tmp*/
 *.py[cod]
 artifacts/
+audit/
+models/
 

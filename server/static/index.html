@@ -52,12 +52,15 @@
     <select id="identity"></select>
     <input id="question" placeholder="输入问题，例如：旷工超过多少天会被劝退？" />
     <button id="ask">提问</button>
+    <button id="audit" style="background:#30363d">审计日志</button>
   </div>
   <div class="hint">
     身份由 <b>服务端令牌</b>决定（客户端无法伪造角色）——用不同身份问同一问题，
     可见内容层级不同：普通员工只能看公开条款，HR 才能看管理细则。
+    每次提问都会留痕（谁·问了什么·为什么被截断），<b>审计日志本身也需 HR 级别</b>。
   </div>
   <div id="result"></div>
+  <div id="auditpanel"></div>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -134,6 +137,55 @@ async function ask() {
 
 loadDatasets();
 loadIdentities();
+
+// ---- 审计日志面板（#5）：受权限门控，非 HR 会看到"被拒绝" ----
+$("audit").addEventListener("click", loadAudit);
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"]/g,
+    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+async function loadAudit() {
+  $("auditpanel").innerHTML = '<div class="loading">读取审计日志…</div>';
+  const res = await fetch("/api/audit?limit=20",
+    { headers: { "X-API-Token": $("identity").value } });
+  if (!res.ok) {
+    const d = await res.json().catch(() => ({}));
+    $("auditpanel").innerHTML = `<div class="card">
+      <span class="tag t-deny">被拒绝（${res.status}）</span>
+      <div class="hint" style="margin:8px 0 0">${esc(d.detail || "")}</div>
+      <div class="prec" style="margin-top:8px">审计日志同样受权限门控——连"谁查过什么"都不能随便看。</div>
+    </div>`;
+    return;
+  }
+  const d = await res.json();
+  const s = d.stats || {};
+  const rows = (d.records || []).map(r => `<tr>
+      <td>${esc(r.ts)}</td><td>${esc(r.event)}</td>
+      <td>${esc(r.role || r.identity_label || "-")}</td>
+      <td>${esc(r.verdict || "-")}</td>
+      <td>${esc(r.question || (r.question_sha256 ? "sha256:" + r.question_sha256 : "-"))}</td>
+      <td>${esc((r.denied_fields || []).join(",") || "-")}</td>
+      <td>${esc(r.latency_ms ?? "-")}</td></tr>`).join("");
+  $("auditpanel").innerHTML = `<div class="card">
+    <div class="label">审计汇总</div>
+    <div class="prec">共 ${s.total} 条 · 已落盘 ${s.written_to_disk} 条 · 写盘失败 ${s.write_errors}
+      · 鉴权失败 <b>${s.auth_failures}</b> 次 · 独立令牌指纹 ${s.unique_token_fingerprints} 个
+      · 平均延迟 ${s.latency_ms_avg ?? "-"} ms · 最慢 ${s.latency_ms_max ?? "-"} ms</div>
+    <div class="prec">判定分布：${esc(JSON.stringify(s.by_verdict || {}))}</div>
+    <div class="prec">事件分布：${esc(JSON.stringify(s.by_event || {}))}</div>
+    <div class="prec">日志文件：${esc(s.log_path || "")}（首次 ${esc(s.first_ts || "-")} ~ 最后 ${esc(s.last_ts || "-")}）</div>
+    <div class="label">最近记录（最新在前）</div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead><tr style="color:var(--dim);text-align:left">
+        <th>时间</th><th>事件</th><th>身份</th><th>判定</th><th>问题</th><th>截断</th><th>ms</th>
+      </tr></thead>
+      <tbody>${rows || '<tr><td colspan="7">暂无记录</td></tr>'}</tbody>
+    </table>
+    <div class="prec" style="margin-top:8px">⚠️ 日志只存令牌 SHA-256 指纹，不存令牌原文。</div>
+  </div>`;
+}
 </script>
 </body>
 </html>
