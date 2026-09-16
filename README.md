@@ -23,9 +23,10 @@
 | 身份解析（精确层 + 神经层混合） | name/alias 精确命中 **100%**；神经层 heldout **99%** | [`V62_OBSERVER_REPORT.md`](V62_OBSERVER_REPORT.md) |
 | 理解层（QueryUnderstanding） | 33 条盲测（口语改写/网页语境/库外对象）**100%** | [`V63_RECURSION_REPORT.md`](V63_RECURSION_REPORT.md) |
 | 递归层（确定性关系图） | AI/电影/国家**三域** 全 **100%** | 同上 |
-| **ANN 规模化检索**（按权限分区） | 1k/10k/50k 全配置**跨级泄漏 0**；5 万条扫 14.9% 达忠实度 0.987（15.7×）。**语义质量待 ONNX 模型实测** | [`V63_ANN_POC.md`](V63_ANN_POC.md) |
+| **ANN 规模化检索**（按权限分区） | 1k/10k/50k 全配置**跨级泄漏 0**；5 万条扫 14.9% 达忠实度 0.987（15.7×） | [`V63_ANN_POC.md`](V63_ANN_POC.md) |
+| **语义检索**（本地 ONNX int8，数据不出内网） | 措辞远离关键词时：关键词检索 **11%** → 语义 **78%**；措辞贴近时均 100%（关键词排名更优 → 结论是**混合检索**） | [`V63_SEMANTIC_RETRIEVAL_POC.md`](V63_SEMANTIC_RETRIEVAL_POC.md) |
 
-**诚实声明**（项目一贯纪律，负结果完整存档）：零样本跨域迁移不成立（实测 5.2% ≈ 随机）；TTT 查询编码为负结果；身份层对"措辞远离训练"的问法泛化有限；**ANN 目前只用无语义哈希编码器验证了索引结构与权限分区，检索质量尚未测得**——这些边界都有报告与数据支撑，不粉饰。
+**诚实声明**（项目一贯纪律，负结果完整存档）：零样本跨域迁移不成立（实测 5.2% ≈ 随机）；TTT 查询编码为负结果；身份层对"措辞远离训练"的问法泛化有限；ANN 忠实度在**合成干扰语料**上测得、会高估 IVF；语义检索实测仅 **9 条**远离查询、样本量偏小；**编码器与 ANN 均未接入服务**（服务目前仍走关键词 + LLM 路径）——这些边界都有报告与数据支撑，不粉饰。
 
 ## 架构一览
 
@@ -50,7 +51,7 @@
 # 1. 安装（Python 3.10+ / PyTorch 2.x）
 pip install -e .[dev]
 
-# 2. 全量测试（63 passed）
+# 2. 全量测试（85 passed）
 #    注意：pyproject.toml 里 testpaths=["tests"]，放在仓库根目录的 test_*.py 会被静默跳过
 python -m pytest tests/ -q
 
@@ -78,6 +79,13 @@ python verify_live_auth.py        # 19 项在线鉴权/越权/审计验证（需
 #    实测：5 万条扫 14.9% 达忠实度 0.987；≤1 万条建议直接用暴力精确检索
 python -m pip install -r requirements-ann.txt
 python eval_ann_index.py --sizes 10000 50000 --cluster-multiplier 4
+
+# 8. 语义检索实测（本地 ONNX int8，数据不出内网）
+#    结论：措辞远离关键词时 关键词检索 11% → 语义 78%；措辞贴近时两者均 100%
+python eval_semantic_retrieval.py                    # 零依赖基线（无需模型）
+python fetch_embedding_model.py --endpoint https://hf-mirror.com
+$env:GOVLAYER_ONNX_MODEL="models\bge-small-zh-v1.5-int8"
+python eval_semantic_retrieval.py --compare
 ```
 
 > 部署细节、Docker 用法、3 分钟现场演示脚本见 [`DEPLOY.md`](DEPLOY.md)。
@@ -96,6 +104,7 @@ TOB_POC_REPORT.md   企业 AI 治理落地完整报告（toB 入口）
 RAG_FUSION_POC.md   RAG × C-Former 融合 POC
 DEPLOY.md           部署说明（本地/Docker、接口表、3 分钟演示脚本）
 V63_ANN_POC.md      ANN 规模化检索 POC（权限分区零泄漏 / 校准 / 负结果）
+V63_SEMANTIC_RETRIEVAL_POC.md  语义检索 POC（措辞贴近 vs 远离，分组实测）
 ```
 
 ## 工程
