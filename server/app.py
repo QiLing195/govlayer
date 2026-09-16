@@ -47,7 +47,10 @@ from cformer_v63.governance import GovLayer, load_dataset  # noqa: E402
 from cformer_v63.semantic import LLMSemanticBackend  # noqa: E402
 # 本地语义检索（#4b）：依赖可选。numpy/onnxruntime 缺失时该模块自身退化为不可用，
 # 不会拖垮服务启动——默认服务镜像不含这两个依赖。
-from cformer_v63.local_semantic import build_local_retriever  # noqa: E402
+from cformer_v63.local_semantic import (  # noqa: E402
+    DEFAULT_MIN_SCORE,
+    build_local_retriever,
+)
 from auth import DEMO_TOKENS, dev_mode, resolve_identity, role_for_level  # noqa: E402
 from audit import AuditLog, question_field, token_fingerprint  # noqa: E402
 
@@ -66,6 +69,7 @@ AUDIT = AuditLog()
 # ---- 知识库加载（dataset 驱动：新客户只需加一个 gov_*.json）----
 _LAYERS: dict[str, GovLayer] = {}
 _DATASETS: dict[str, dict] = {}
+_WARNED_UNSET_FLOOR = [False]   # "未标定阈值"只提示一次（本函数按数据集调用多次）
 
 
 def _load_all_datasets() -> None:
@@ -83,6 +87,16 @@ def _load_all_datasets() -> None:
         spec = load_dataset(path)
         dataset_id = path.stem.replace("gov_", "")
         retriever = (build_local_retriever(spec["objects"]) if use_local else None)
+        if retriever is not None and min_score is None and not _WARNED_UNSET_FLOOR[0]:
+            # 阈值没有单一适用值（实测四份语料 0.499~0.567），必须逐库标定。
+            # 用兜底值时必须**说出来**，否则"未标定"会被当成"已调好"。
+            _WARNED_UNSET_FLOOR[0] = True
+            print("[local-semantic] ⚠️ 未设置 GOVLAYER_SEMANTIC_MIN_SCORE，"
+                  f"使用兜底值 {DEFAULT_MIN_SCORE}。")
+            print("           实测四份语料的建议值为 0.499 / 0.535 / 0.557 / 0.567 —— "
+                  "没有任何单一值适用。")
+            print("           每份知识库都应单独标定（calibrate_threshold.py），"
+                  "否则会放进跑题问题、进而编出'制度中有相关规定'。")
         pref = os.environ.get("GOVLAYER_RETRIEVAL", "auto").strip().lower() or "auto"
         if pref not in ("auto", "local", "llm"):
             print(f"[local-semantic] 非法 GOVLAYER_RETRIEVAL={pref!r} → 按 auto 处理")
