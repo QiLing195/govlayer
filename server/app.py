@@ -45,6 +45,9 @@ sys.path.insert(0, str(SERVER_DIR))   # 使同目录 auth.py 可导入
 
 from cformer_v63.governance import GovLayer, load_dataset  # noqa: E402
 from cformer_v63.semantic import LLMSemanticBackend  # noqa: E402
+# 本地语义检索（#4b）：依赖可选。numpy/onnxruntime 缺失时该模块自身退化为不可用，
+# 不会拖垮服务启动——默认服务镜像不含这两个依赖。
+from cformer_v63.local_semantic import build_local_retriever  # noqa: E402
 from auth import DEMO_TOKENS, dev_mode, resolve_identity, role_for_level  # noqa: E402
 from audit import AuditLog, question_field, token_fingerprint  # noqa: E402
 
@@ -66,13 +69,31 @@ _DATASETS: dict[str, dict] = {}
 
 
 def _load_all_datasets() -> None:
+    # 混合检索开关：默认开启，但只有真正配好 GOVLAYER_ONNX_MODEL 才会生效；
+    # 置 GOVLAYER_LOCAL_SEMANTIC=0 可强制退回纯关键词（排障用）。
+    use_local = os.environ.get("GOVLAYER_LOCAL_SEMANTIC", "1") not in ("0", "false", "False")
+    # 相似度下限：未在真实语料上校准，允许用环境变量覆盖（见 local_semantic.py 的说明）
+    raw_floor = os.environ.get("GOVLAYER_SEMANTIC_MIN_SCORE", "").strip()
+    try:
+        min_score = float(raw_floor) if raw_floor else None
+    except ValueError:
+        print(f"[local-semantic] 忽略非法 GOVLAYER_SEMANTIC_MIN_SCORE={raw_floor!r}")
+        min_score = None
     for path in sorted(DATA_DIR.glob("gov_*.json")):
         spec = load_dataset(path)
         dataset_id = path.stem.replace("gov_", "")
+        retriever = (build_local_retriever(spec["objects"]) if use_local else None)
+        pref = os.environ.get("GOVLAYER_RETRIEVAL", "auto").strip().lower() or "auto"
+        if pref not in ("auto", "local", "llm"):
+            print(f"[local-semantic] 非法 GOVLAYER_RETRIEVAL={pref!r} → 按 auto 处理")
+            pref = "auto"
         _LAYERS[dataset_id] = GovLayer(
             objects=spec["objects"], roles=spec["roles"],
             probe_pairs=spec["probe_rules"], cases=spec["cases"],
             semantic_backend=SEMANTIC if SEMANTIC.available else None,
+            semantic_retriever=retriever,
+            semantic_min_score=min_score,
+            retrieval_preference=pref,
         )
         _DATASETS[dataset_id] = {
             "id": dataset_id,
@@ -80,6 +101,8 @@ def _load_all_datasets() -> None:
             "roles": spec["roles"],
             "n_objects": len(spec["objects"]),
             "n_cases": len(spec["cases"]),
+            "local_semantic": retriever is not None,
+            "llm_semantic": SEMANTIC.available,
         }
 
 
@@ -104,7 +127,8 @@ class AskResponse(BaseModel):
     precedents: list[dict]       # 过往先例（仅供参考）
     boundary_note: str           # 边界声明（空白/权限/先例提示）
     typo_corrections: list[str]  # 错别字纠正记录（透明可审计）
-    semantic_used: bool          # 是否走了 LLM 语义检索（否则关键词回退）
+    semantic_used: bool          # LLM 是否参与（检索或覆盖判定）；纯本地检索时为 False
+    retrieval_mode: str          # keyword | hybrid | llm —— 本次实际生效的检索路径
     identity: str                # 服务端解析出的身份（来自令牌，非客户端声明）
     llm_used: bool
 
@@ -234,6 +258,7 @@ def ask(req: AskRequest,
         rec.update(event="ask", status=200, verdict=ans.verdict,
                    hit_ids=list(ans.hit_ids), denied_fields=list(ans.denied_fields),
                    n_sources=len(sources), semantic_used=bool(ans.semantic_used),
+                   retrieval_mode=ans.retrieval_mode,
                    llm_used=bool(llm_text),
                    typo_corrections=list(ans.typo_corrections))
 
@@ -250,6 +275,7 @@ def ask(req: AskRequest,
             boundary_note=ans.boundary_note or "",
             typo_corrections=ans.typo_corrections,
             semantic_used=ans.semantic_used,
+            retrieval_mode=ans.retrieval_mode,
             identity=f"{identity.label}（级别 {identity.level} → 角色 {role}）",
             llm_used=bool(llm_text),
         )

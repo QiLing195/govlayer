@@ -122,8 +122,10 @@ async function ask() {
       <span class="tag" style="background:rgba(68,147,248,.15);color:var(--accent)">${d.identity || ("角色 " + d.role)}</span>
       ${d.llm_used ? '<span class="tag" style="background:rgba(68,147,248,.15);color:var(--accent)">LLM 生成</span>'
                    : '<span class="tag" style="background:rgba(139,147,167,.15);color:var(--dim)">条款原文</span>'}
-      ${d.semantic_used ? '<span class="tag" style="background:rgba(63,185,80,.15);color:var(--ok)">语义检索</span>'
-                        : '<span class="tag" style="background:rgba(139,147,167,.15);color:var(--dim)">关键词检索</span>'}
+      ${d.semantic_used ? '<span class="tag" style="background:rgba(63,185,80,.15);color:var(--ok)">LLM 语义检索</span>'
+                        : (d.retrieval_mode === "hybrid"
+                           ? '<span class="tag" style="background:rgba(63,185,80,.15);color:var(--ok)">本地混合检索</span>'
+                           : '<span class="tag" style="background:rgba(139,147,167,.15);color:var(--dim)">关键词检索</span>')}
       ${typo}
       <div class="label">回答</div>
       <div class="answer">${d.answer_text}</div>

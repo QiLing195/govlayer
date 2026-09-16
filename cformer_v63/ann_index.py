@@ -92,17 +92,39 @@ class _Partition:
         self.centroids, assign = _kmeans(self.vecs, n_clusters, iters, seed + self.level)
         self.lists = [np.flatnonzero(assign == c) for c in range(len(self.centroids))]
 
-    def search(self, query_vec: np.ndarray, n_probe: int,
-               top_k: int) -> tuple[list[tuple[str, float, int]], int]:
-        """返回 ([(object_id, score, level)], 实际扫描的向量数)。"""
+    def search(self, query_vec: np.ndarray, n_probe: int, top_k: int,
+               min_score: float | None = None) -> tuple[list[tuple[str, float, int]], int]:
+        """返回 ([(object_id, score, level)], 实际扫描的向量数)。
+
+        min_score: 相似度下限。**接进产品时必须给**——
+        向量检索永远会返回 top-k，哪怕所有条目与问题毫不相关（相似度全为 0）。
+        没有下限，"制度空白/范围外"这类判定会被静默废掉：系统对任何问题都答得出来。
+        """
         if not self.entries:
             return [], 0
         assert self.vecs is not None
+
+        def _keep(scores: np.ndarray, order: np.ndarray, entry_of: np.ndarray) -> list:
+            """order 是 **scores 的位置**下标；entry_of[pos] 才是 **entries 的下标**。
+
+            这两个下标空间必须分开处理。聚类分支里 cand 本身就是 entries 下标数组，
+            直接拿它索引 scores（长度只有 len(cand)）会越界或静默取到错误分数——
+            实测 n_probe=1 且簇数>1 时必然 IndexError。
+            """
+            out: list[tuple[str, float, int]] = []
+            for pos in order:
+                if min_score is not None and scores[pos] < min_score:
+                    continue
+                out.append((self.entries[entry_of[pos]].object_id,
+                            float(scores[pos]), self.level))
+                if len(out) >= top_k:      # 过滤之后再截断，否则名额会被不合格项占掉
+                    break
+            return out
+
         if self.centroids is None:
             scores = self.vecs @ query_vec
-            order = np.argsort(-scores)[:top_k]
-            return ([(self.entries[i].object_id, float(scores[i]), self.level) for i in order],
-                    len(self.entries))
+            order = np.argsort(-scores)
+            return _keep(scores, order, np.arange(len(self.entries))), len(self.entries)
 
         centroid_sims = self.centroids @ query_vec
         probe = np.argsort(-centroid_sims)[:max(1, min(n_probe, len(self.centroids)))]
@@ -111,9 +133,8 @@ class _Partition:
             return [], 0
         cand = np.concatenate(picked)
         scores = self.vecs[cand] @ query_vec
-        order = np.argsort(-scores)[:top_k]
-        return ([(self.entries[cand[i]].object_id, float(scores[i]), self.level) for i in order],
-                len(cand))
+        order = np.argsort(-scores)
+        return _keep(scores, order, cand), len(cand)
 
 
 class PermissionPartitionedIndex:
@@ -194,8 +215,13 @@ class PermissionPartitionedIndex:
 
     # ---------------- 检索 ----------------
     def search(self, query: str, level: int, top_k: int = 5,
-               n_probe: int | None = None) -> list[tuple[str, float, int]]:
-        """级别 level 的检索。返回 [(object_id, score, level)]，按分数降序、按对象去重。"""
+               n_probe: int | None = None,
+               min_score: float | None = None) -> list[tuple[str, float, int]]:
+        """级别 level 的检索。返回 [(object_id, score, level)]，按分数降序、按对象去重。
+
+        min_score: 相似度下限，用于把"其实没有任何相关条款"识别出来。
+                   不传则不做过滤（评测/校准场景需要看完整排序）。
+        """
         q = l2_normalize(np.asarray(self.encoder.encode([query], is_query=True),
                                     dtype=np.float32))[0]
         n_probe = self.n_probe if n_probe is None else n_probe
@@ -206,7 +232,7 @@ class PermissionPartitionedIndex:
             if lvl > level:
                 continue                      # ← 结构性隔离：更高级别分区根本不可达
             searched.append(lvl)
-            hits, n = self.partitions[lvl].search(q, n_probe, top_k)
+            hits, n = self.partitions[lvl].search(q, n_probe, top_k, min_score=min_score)
             scanned += n
             for oid, score, hit_level in hits:
                 prev = merged.get(oid)

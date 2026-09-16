@@ -150,14 +150,29 @@ class OnnxEncoder:
 
 # ------------------------------------------------------------------ 工厂
 
+# 编码器缓存：多个知识库/多个调用方会重复请求同一编码器，
+# 不缓存就会把 24MB 的 ONNX 模型重复加载 N 次（内存与启动时间都白涨）。
+_ENCODER_CACHE: dict[tuple, object] = {}
+
+
 def build_encoder(prefer: str = "auto", dim: int = 256, verbose: bool = True):
-    """按可用性选编码器。
+    """按可用性选编码器（同一配置只加载一次）。
 
     prefer: "auto" | "onnx" | "hashing"
     拿不到 ONNX 模型时**明确降级并说清后果**，绝不静默用无语义编码器冒充语义检索。
     """
     model_dir = os.environ.get(ONNX_MODEL_ENV, "").strip()
+    key = (prefer, model_dir, dim)
+    cached = _ENCODER_CACHE.get(key)
+    if cached is not None:
+        return cached
 
+    encoder = _build_encoder(prefer, dim, verbose, model_dir)
+    _ENCODER_CACHE[key] = encoder
+    return encoder
+
+
+def _build_encoder(prefer: str, dim: int, verbose: bool, model_dir: str):
     if prefer in ("auto", "onnx") and model_dir:
         try:
             encoder = OnnxEncoder(model_dir)

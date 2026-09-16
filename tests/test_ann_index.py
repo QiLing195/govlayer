@@ -166,6 +166,32 @@ def test_stats_report_encoder_and_levels() -> None:
     assert "hashing" in stats["encoder"]
 
 
+# ---------------------------------------------------------------- 下标空间回归
+
+def test_single_probe_on_clustered_index_is_safe() -> None:
+    """回归守卫：n_probe < 簇数 时，cand 里的 **entries 下标**会 ≥ len(scores)。
+
+    曾把这两个下标空间混用（拿 entries 下标去索引 scores），
+    导致聚类索引在 n_probe=1 时必然 IndexError——而 5 万条语料正是这种配置。
+    另一个测试恰好传 n_probe=簇数（cand 成为 0..n-1 的排列），把越界掩盖了。
+    """
+    index = PermissionPartitionedIndex(build_encoder("hashing", verbose=False),
+                                       brute_force_threshold=0).build(OBJECTS)
+    assert index.partitions[0].centroids is not None
+    for q in ("上班时间", "打卡", "高管年薪", "请假", "考勤制度"):
+        hits = index.search(q, level=2, top_k=5, n_probe=1)      # 不得抛异常
+        assert len(hits) <= 5
+        for _oid, score, _lvl in hits:
+            assert -1.0001 <= score <= 1.0001                    # 不是错位取到的分数
+
+
+def test_min_score_filters_before_truncation_on_clustered_index() -> None:
+    """极高下限应把全部条目滤掉（返回空），而不是让不合格项占满 top_k 名额。"""
+    index = PermissionPartitionedIndex(build_encoder("hashing", verbose=False),
+                                       brute_force_threshold=0).build(OBJECTS)
+    assert index.search("上班时间", level=2, top_k=5, n_probe=1, min_score=1.01) == []
+
+
 # ---------------------------------------------------------------- 校准
 
 def test_calibrate_n_probe_reaches_target_and_sets_default() -> None:

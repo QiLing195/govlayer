@@ -160,10 +160,14 @@ def main() -> int:
     check(status == 200 and parse_level(mgr) == 1,
           "经理令牌解析出的级别为 1", f"HTTP {status} identity={mgr.get('identity')!r}")
 
-    # 7. 语义后端是否真的在工作
-    check(bool(hr.get("semantic_used")),
-          "语义检索已启用（DEEPSEEK_API_KEY 生效）",
-          f"semantic_used={hr.get('semantic_used')} llm_used={hr.get('llm_used')}")
+    # 7. 语义检索是否生效（#4b 之后有**两条**路径，任一生效即可）
+    #    断言"必须有 DEEPSEEK_API_KEY"已经过时：本地混合检索生效时它是 False。
+    semantic_path_active = (bool(hr.get("semantic_used"))
+                            or hr.get("retrieval_mode") == "hybrid")
+    check(semantic_path_active,
+          "至少一条语义检索路径生效（本地 hybrid 或 LLM）",
+          f"semantic_used={hr.get('semantic_used')} "
+          f"retrieval_mode={hr.get('retrieval_mode')!r} llm_used={hr.get('llm_used')}")
 
     # 8. 审计日志（#5）：自身受门控 + 留痕 + 不落令牌原文
     status, denied = _request("GET", "/api/audit", token="demo-l0-employee")
@@ -199,6 +203,23 @@ def main() -> int:
           "未认证请求不落问题原文（防匿名日志投毒/撑爆磁盘）",
           f"auth_failed {len(af)} 条，其中含 question 的 "
           f"{sum(1 for r in af if 'question' in r)} 条")
+
+    # 9. 检索路径 + 相似度下限（#4b 接入混合检索后新增）
+    check(hr.get("retrieval_mode") in ("hybrid", "llm", "keyword"),
+          "检索路径已上报（retrieval_mode）",
+          f"retrieval_mode={hr.get('retrieval_mode')!r} "
+          f"semantic_used={hr.get('semantic_used')} llm_used={hr.get('llm_used')}")
+
+    status, oos = _request("POST", "/api/ask",
+                           {"dataset": DATASET, "question": "公司食堂几点开饭？"},
+                           token="demo-l0-employee")
+    # 无关问题不得被判成"可答"：向量检索永远会返回 top-k，
+    # 没有相似度下限就会把任何问题都强行捞回几条 → 空白识别被静默废掉。
+    check(status == 200 and oos.get("verdict") in ("out_of_scope", "gap"),
+          "无关问题未被判为可答（相似度下限/空白识别生效）",
+          f"HTTP {status} verdict={oos.get('verdict')!r} "
+          f"mode={oos.get('retrieval_mode')!r} "
+          f"sources={len(oos.get('visible_sources') or [])}")
 
     # 汇总
     return _report()
